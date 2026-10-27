@@ -1,0 +1,45 @@
+{
+	"$schema": "./node_modules/@emdash-cms/plugin-cli/schemas/emdash-plugin.schema.json",
+
+	"slug": "bluesky-feed",
+	"publisher": "did:plc:myrtyr2rsjiivzlp5m6qevv5",
+
+	"license": "MIT",
+	"author": { "name": "Rie Tamura", "url": "https://bsky.app/profile/connectobasan.com" },
+	"security": { "url": "https://github.com/RieTamura" },
+	"description": "Shows your own Bluesky posts on your EmDash site by syncing them into a collection.",
+
+	// Trust contract — what runtime APIs the plugin asks for.
+	// Changing these between releases requires a version bump because
+	// installed users have consented to the old contract.
+	"capabilities": [
+		// Read the author's public feed from Bluesky's AppView.
+		"network:request",
+		// Check that the target collection has the fields the plugin writes.
+		"schema:read",
+		// Save each new post as an entry, then publish it.
+		"content:write",
+		"content:publish"
+	],
+	"allowedHosts": ["public.api.bsky.app"],
+	"storage": {
+		// One record per saved post, keyed by its record key, so a post is never saved twice.
+		"posts": { "indexes": ["postedAt"] }
+	},
+
+	"admin": {
+		"settingsSchema": {
+			"handle": {
+				"label": "Bluesky handle",
+				"description": "The account whose posts to show, such as name.bsky.social. Replies and reposts are skipped.",
+				"type": "string"
+			},
+			"collection": {
+				"label": "Collection",
+				"description": "The collection posts are saved to. It must have the fields listed in the plugin README.",
+				"type": "string",
+				"default": "bluesky"
+			}
+		}
+	}
+}
