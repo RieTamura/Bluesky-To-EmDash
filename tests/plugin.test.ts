@@ -113,14 +113,35 @@ describe("sync", () => {
 		);
 		await h.http.respond(FEED_URL, feedResponse(feed));
 		const first = await h.transport.invokeRoute("sync", {}, { method: "POST" });
-		expect(first).toEqual({ status: "ok", created: 3, remaining: 2 });
+		expect(first).toEqual({ status: "ok", created: 3, published: 3, remaining: 2 });
 		const saved = (await h.inspect.storage.list("posts")).map((entry) => entry.id).sort();
 		expect(saved).toEqual(["p3", "p4", "p5"]);
 
 		await h.http.respond(FEED_URL, feedResponse(feed));
 		const second = await h.transport.invokeRoute("sync", {}, { method: "POST" });
-		expect(second).toEqual({ status: "ok", created: 2, remaining: 0 });
+		expect(second).toEqual({ status: "ok", created: 2, published: 2, remaining: 0 });
 		expect(await h.inspect.content.list("bluesky")).toHaveLength(5);
+	});
+
+	it("publishes a post an earlier run saved but did not publish", async () => {
+		const h = await setup();
+		const draft = await h.fixtures.content("bluesky", {
+			slug: "aaa",
+			data: { title: "post aaa", text: "post aaa", posted_at: "2026-10-27T10:00:00.000Z" },
+		});
+		expect(draft.status).not.toBe("published");
+		await h.fixtures.plugin.storage("posts", "aaa", {
+			contentId: draft.id,
+			postedAt: "2026-10-27T10:00:00.000Z",
+		});
+		await h.http.respond(FEED_URL, feedResponse([feedPost("aaa", "2026-10-27T10:00:00.000Z")]));
+
+		const result = await h.transport.invokeRoute("sync", {}, { method: "POST" });
+
+		expect(result).toEqual({ status: "ok", created: 0, published: 1, remaining: 0 });
+		expect((await h.inspect.content.get("bluesky", draft.id))?.status).toBe("published");
+		expect(await h.inspect.content.list("bluesky")).toHaveLength(1);
+		expect(await h.inspect.storage.get("posts", "aaa")).toMatchObject({ published: true });
 	});
 
 	it("does nothing until a handle is set", async () => {
