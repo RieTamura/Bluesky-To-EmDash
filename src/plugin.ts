@@ -7,32 +7,46 @@ const CRON_TASK = "sync";
 const CRON_SCHEDULE = "*/5 * * * *";
 /** How many recent posts to look at on each run. */
 const FETCH_LIMIT = 30;
+/** How many existing entries to check against, newest first. */
+const EXISTING_LIMIT = 100;
 /**
- * How many posts to save or publish on each run. Each one takes a few host
- * calls, and the Cloudflare sandbox allows few subrequests per invocation;
- * the rest are picked up on the next run.
+ * How many posts to save or publish on each run. On a deployed site one
+ * save and publish can take several seconds, and the Cloudflare sandbox
+ * allows few subrequests per invocation; the rest wait for the next run.
  */
-const MAX_PER_RUN = 3;
+const MAX_PER_RUN = 1;
 /**
  * Time limit for one scheduled run. The host's default is 5 seconds, which
- * a run that saves and publishes a few posts can exceed when the database
- * is far away.
+ * a deployed run can exceed when the database is far away.
  */
-const CRON_TIMEOUT_MS = 25_000;
+const CRON_TIMEOUT_MS = 120_000;
 
-/** What the plugin remembers about a post it has saved, keyed by record key. */
+/**
+ * What the plugin remembers about a post it has saved, keyed by record
+ * key. It is what stops a post deleted in the admin from coming back.
+ */
 interface SyncedPost {
 	contentId: string;
 	postedAt: string;
-	/** Set once the entry is published, or found gone; a saved draft is retried. */
-	published?: boolean;
 }
 
 type SyncResult =
-	| { status: "ok"; created: number; published: number; remaining: number }
+	| {
+			status: "ok";
+			created: number;
+			published: number;
+			duplicatesRemoved: number;
+			remaining: number;
+	  }
 	| { status: "not_configured" }
 	| { status: "collection_invalid"; collection: string; problems: string[] }
 	| { status: "fetch_failed"; httpStatus: number };
+
+interface Existing {
+	id: string;
+	status: string;
+	createdAt: string;
+}
 
 async function scheduleSync(ctx: PluginContext) {
 	await ctx.cron?.schedule(CRON_TASK, { schedule: CRON_SCHEDULE });
@@ -55,6 +69,47 @@ async function collectionProblems(ctx: PluginContext, slug: string): Promise<str
 		if (!actual) return [`missing field "${slug}" (${type})`];
 		return actual === type ? [] : [`field "${slug}" is ${actual}, expected ${type}`];
 	});
+}
+
+/**
+ * Entries already in the collection, grouped by the post they hold. A run
+ * can be cut off between saving an entry and remembering it, so this, not
+ * plugin storage, is what decides whether a post is already saved.
+ */
+async function existingByUri(ctx: PluginContext, collection: string) {
+	const { items } = await ctx.content!.list(collection, { limit: EXISTING_LIMIT });
+	const byUri = new Map<string, Existing[]>();
+	for (const item of items) {
+		const uri = item.data.post_uri;
+		if (typeof uri !== "string") continue;
+		const list = byUri.get(uri) ?? [];
+		list.push({ id: item.id, status: item.status, createdAt: item.createdAt });
+		byUri.set(uri, list);
+	}
+	return byUri;
+}
+
+/** The entry to keep among copies of one post: a published one, else the oldest. */
+function keeperOf(copies: Existing[]): Existing {
+	const sorted = [...copies].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+	return sorted.find((copy) => copy.status === "published") ?? sorted[0]!;
+}
+
+async function publish(ctx: PluginContext, collection: string, id: string): Promise<boolean> {
+	try {
+		const versioned = await ctx.content!.getVersioned!(collection, id);
+		if (!versioned) return false;
+		if (versioned.item.status !== "published") {
+			await ctx.content!.publish!(collection, id, { _rev: versioned._rev });
+		}
+		return true;
+	} catch (error) {
+		ctx.log.error("Saved a Bluesky post but could not publish it", {
+			contentId: id,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return false;
+	}
 }
 
 async function sync(ctx: PluginContext): Promise<SyncResult> {
@@ -80,62 +135,58 @@ async function sync(ctx: PluginContext): Promise<SyncResult> {
 	const posts = ownPosts(Array.isArray(body.feed) ? body.feed : []);
 
 	const synced = ctx.storage.posts!;
-	const known = await synced.getMany(posts.map((post) => post.rkey));
-	// Saved by an earlier run that stopped before publishing.
-	const drafts = posts.flatMap((post) => {
-		const record = known.get(post.rkey) as SyncedPost | undefined;
-		return record && !record.published ? [{ rkey: post.rkey, record }] : [];
-	});
-	const pending = posts.filter((post) => !known.has(post.rkey));
+	const [existing, remembered] = await Promise.all([
+		existingByUri(ctx, collection),
+		synced.getMany(posts.map((post) => post.rkey)),
+	]);
 
-	const content = ctx.content!;
-	let budget = MAX_PER_RUN;
-	let published = 0;
-	for (const { rkey, record } of drafts.slice(0, budget)) {
-		budget--;
-		if (await publishSaved(ctx, collection, rkey, record)) published++;
+	// Copies left by runs that were cut off: keep one, move the rest to the trash.
+	let duplicatesRemoved = 0;
+	for (const copies of existing.values()) {
+		if (copies.length < 2) continue;
+		const keep = keeperOf(copies);
+		for (const copy of copies) {
+			if (copy === keep) continue;
+			if (await ctx.content!.delete!(collection, copy.id)) duplicatesRemoved++;
+		}
+		copies.splice(0, copies.length, keep);
 	}
 
+	let budget = MAX_PER_RUN;
+	let published = 0;
+
+	// Saved earlier but never published.
+	for (const post of posts) {
+		if (budget === 0) break;
+		const entry = existing.get(post.fields.post_uri)?.[0];
+		if (!entry || entry.status === "published") continue;
+		budget--;
+		if (await publish(ctx, collection, entry.id)) published++;
+		if (!remembered.has(post.rkey)) {
+			await synced.put(post.rkey, { contentId: entry.id, postedAt: post.fields.posted_at });
+		}
+	}
+
+	// Not saved yet, and not deleted in the admin after an earlier save.
+	const pending = posts.filter(
+		(post) => !existing.has(post.fields.post_uri) && !remembered.has(post.rkey),
+	);
 	let created = 0;
 	for (const post of pending.slice(0, budget)) {
-		const item = await content.create!(collection, { ...post.fields });
-		const record: SyncedPost = { contentId: item.id, postedAt: post.fields.posted_at };
-		// Remember it before publishing, so a failed publish never leads to a duplicate.
-		await synced.put(post.rkey, record);
+		const item = await ctx.content!.create!(collection, { ...post.fields });
+		await synced.put(post.rkey, { contentId: item.id, postedAt: post.fields.posted_at } satisfies SyncedPost);
 		created++;
-		if (await publishSaved(ctx, collection, post.rkey, record)) published++;
+		if (await publish(ctx, collection, item.id)) published++;
 	}
 
 	await ctx.kv.set("state:lastSync", new Date().toISOString());
-	return { status: "ok", created, published, remaining: pending.length - created };
-}
-
-/**
- * Publishes a saved entry and records that it is done. Returns false if
- * it could not be published; the next run tries again.
- */
-async function publishSaved(
-	ctx: PluginContext,
-	collection: string,
-	rkey: string,
-	record: SyncedPost,
-): Promise<boolean> {
-	const content = ctx.content!;
-	try {
-		const versioned = await content.getVersioned!(collection, record.contentId);
-		// Deleted in the admin: leave it deleted.
-		if (versioned && versioned.item.status !== "published") {
-			await content.publish!(collection, record.contentId, { _rev: versioned._rev });
-		}
-		await ctx.storage.posts!.put(rkey, { ...record, published: true } satisfies SyncedPost);
-		return !!versioned;
-	} catch (error) {
-		ctx.log.error("Saved a Bluesky post but could not publish it", {
-			contentId: record.contentId,
-			error: error instanceof Error ? error.message : String(error),
-		});
-		return false;
-	}
+	return {
+		status: "ok",
+		created,
+		published,
+		duplicatesRemoved,
+		remaining: pending.length - created,
+	};
 }
 
 const plugin: SandboxedPlugin = {
@@ -147,8 +198,13 @@ const plugin: SandboxedPlugin = {
 			handler: async (event, ctx) => {
 				if (event.name !== CRON_TASK) return;
 				const result = await sync(ctx);
-				if (result.status === "ok" && (result.created > 0 || result.published > 0)) {
-					ctx.log.info("Saved new Bluesky posts", result);
+				if (
+					result.status === "ok" &&
+					(result.created > 0 || result.published > 0 || result.duplicatesRemoved > 0)
+				) {
+					ctx.log.info(
+						`Bluesky Feed synced: ${result.created} saved, ${result.published} published, ${result.duplicatesRemoved} duplicates removed, ${result.remaining} waiting`,
+					);
 				}
 			},
 		},

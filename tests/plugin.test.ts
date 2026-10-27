@@ -106,42 +106,67 @@ describe("sync", () => {
 		expect(await h.inspect.content.list("bluesky")).toHaveLength(1);
 	});
 
-	it("saves a few posts per run, newest first, and the rest on later runs", async () => {
+	it("saves one post per run, newest first, and the rest on later runs", async () => {
 		const h = await setup();
-		const feed = ["p1", "p2", "p3", "p4", "p5"].map((rkey, i) =>
-			feedPost(rkey, `2026-10-2${i + 1}T10:00:00.000Z`),
-		);
-		await h.http.respond(FEED_URL, feedResponse(feed));
-		const first = await h.transport.invokeRoute("sync", {}, { method: "POST" });
-		expect(first).toEqual({ status: "ok", created: 3, published: 3, remaining: 2 });
-		const saved = (await h.inspect.storage.list("posts")).map((entry) => entry.id).sort();
-		expect(saved).toEqual(["p3", "p4", "p5"]);
-
-		await h.http.respond(FEED_URL, feedResponse(feed));
-		const second = await h.transport.invokeRoute("sync", {}, { method: "POST" });
-		expect(second).toEqual({ status: "ok", created: 2, published: 2, remaining: 0 });
-		expect(await h.inspect.content.list("bluesky")).toHaveLength(5);
+		const feed = ["p1", "p2", "p3"].map((rkey, i) => feedPost(rkey, `2026-10-2${i + 1}T10:00:00.000Z`));
+		const results = [];
+		for (let i = 0; i < 4; i++) {
+			await h.http.respond(FEED_URL, feedResponse(feed));
+			results.push(await h.transport.invokeRoute("sync", {}, { method: "POST" }));
+			if (i === 0) {
+				expect((await h.inspect.storage.list("posts")).map((entry) => entry.id)).toEqual(["p3"]);
+			}
+		}
+		expect(results.map((r) => (r as { remaining: number }).remaining)).toEqual([2, 1, 0, 0]);
+		expect(results.map((r) => (r as { created: number }).created)).toEqual([1, 1, 1, 0]);
+		const items = await h.inspect.content.list("bluesky");
+		expect(items).toHaveLength(3);
+		expect(items.every((item) => item.status === "published")).toBe(true);
 	});
 
-	it("publishes a post an earlier run saved but did not publish", async () => {
+	it("publishes a post saved by a run that was cut off before remembering it", async () => {
 		const h = await setup();
 		const draft = await h.fixtures.content("bluesky", {
-			slug: "aaa",
-			data: { title: "post aaa", text: "post aaa", posted_at: "2026-10-27T10:00:00.000Z" },
+			slug: "post-aaa",
+			data: { title: "post aaa", text: "post aaa", post_uri: `at://${DID}/app.bsky.feed.post/aaa` },
 		});
 		expect(draft.status).not.toBe("published");
-		await h.fixtures.plugin.storage("posts", "aaa", {
-			contentId: draft.id,
-			postedAt: "2026-10-27T10:00:00.000Z",
-		});
 		await h.http.respond(FEED_URL, feedResponse([feedPost("aaa", "2026-10-27T10:00:00.000Z")]));
 
 		const result = await h.transport.invokeRoute("sync", {}, { method: "POST" });
 
-		expect(result).toEqual({ status: "ok", created: 0, published: 1, remaining: 0 });
+		expect(result).toEqual({ status: "ok", created: 0, published: 1, duplicatesRemoved: 0, remaining: 0 });
 		expect((await h.inspect.content.get("bluesky", draft.id))?.status).toBe("published");
 		expect(await h.inspect.content.list("bluesky")).toHaveLength(1);
-		expect(await h.inspect.storage.get("posts", "aaa")).toMatchObject({ published: true });
+		expect(await h.inspect.storage.get("posts", "aaa")).toMatchObject({ contentId: draft.id });
+	});
+
+	it("moves extra copies of a post to the trash, keeping one", async () => {
+		const h = await setup();
+		const uri = `at://${DID}/app.bsky.feed.post/aaa`;
+		const first = await h.fixtures.content("bluesky", { slug: "a-1", data: { title: "a", post_uri: uri } });
+		await h.fixtures.content("bluesky", { slug: "a-2", data: { title: "a", post_uri: uri } });
+		await h.fixtures.content("bluesky", { slug: "a-3", data: { title: "a", post_uri: uri } });
+		await h.http.respond(FEED_URL, feedResponse([feedPost("aaa", "2026-10-27T10:00:00.000Z")]));
+
+		const result = await h.transport.invokeRoute("sync", {}, { method: "POST" });
+
+		expect(result).toMatchObject({ duplicatesRemoved: 2, published: 1, created: 0 });
+		const items = await h.inspect.content.list("bluesky");
+		const live = items.filter((item) => item.status !== "trash" && !("deletedAt" in item && item.deletedAt));
+		expect(live.map((item) => item.id)).toContain(first.id);
+		expect((await h.inspect.content.get("bluesky", first.id))?.status).toBe("published");
+	});
+
+	it("does not bring back a post deleted in the admin", async () => {
+		const h = await setup();
+		await h.fixtures.plugin.storage("posts", "aaa", { contentId: "gone", postedAt: "2026-10-27T10:00:00.000Z" });
+		await h.http.respond(FEED_URL, feedResponse([feedPost("aaa", "2026-10-27T10:00:00.000Z")]));
+
+		const result = await h.transport.invokeRoute("sync", {}, { method: "POST" });
+
+		expect(result).toMatchObject({ created: 0, remaining: 0 });
+		expect(await h.inspect.content.list("bluesky")).toHaveLength(0);
 	});
 
 	it("does nothing until a handle is set", async () => {
