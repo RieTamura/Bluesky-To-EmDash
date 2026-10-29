@@ -10,9 +10,12 @@ const FETCH_LIMIT = 30;
 /** How many existing entries to check against, newest first. */
 const EXISTING_LIMIT = 100;
 /**
- * How many posts to save or publish on each run. On a deployed site one
- * save and publish can take several seconds, and the Cloudflare sandbox
- * allows few subrequests per invocation; the rest wait for the next run.
+ * How many posts to save, publish or clean up on each run. On a deployed
+ * site one save and publish can take several seconds, and the Cloudflare
+ * sandbox allows 10 subrequests per invocation, where every `ctx` call
+ * counts as one. A run that saves a post makes 9: settings, schema, feed,
+ * entries, storage, create, remember, revision, publish. The rest wait for
+ * the next run.
  */
 const MAX_PER_RUN = 1;
 /**
@@ -50,6 +53,16 @@ interface Existing {
 
 async function scheduleSync(ctx: PluginContext) {
 	await ctx.cron?.schedule(CRON_TASK, { schedule: CRON_SCHEDULE });
+}
+
+/** All settings in one call, to save subrequests. */
+async function readSettings(ctx: PluginContext) {
+	const values = new Map((await ctx.settings.list()).map(({ key, value }) => [key, value]));
+	const collection = values.get("collection");
+	return {
+		actor: normalizeActor(values.get("handle")),
+		collection: (typeof collection === "string" && collection.trim()) || DEFAULT_COLLECTION,
+	};
 }
 
 /** Accepts "name.bsky.social", "@name.bsky.social", or a DID. */
@@ -113,10 +126,8 @@ async function publish(ctx: PluginContext, collection: string, id: string): Prom
 }
 
 async function sync(ctx: PluginContext): Promise<SyncResult> {
-	const actor = normalizeActor(await ctx.settings.get("handle"));
+	const { actor, collection } = await readSettings(ctx);
 	if (!actor) return { status: "not_configured" };
-	const collectionSetting = await ctx.settings.get<string>("collection");
-	const collection = collectionSetting?.trim() || DEFAULT_COLLECTION;
 
 	const problems = await collectionProblems(ctx, collection);
 	if (problems.length > 0) {
@@ -140,20 +151,21 @@ async function sync(ctx: PluginContext): Promise<SyncResult> {
 		synced.getMany(posts.map((post) => post.rkey)),
 	]);
 
+	let budget = MAX_PER_RUN;
+	let published = 0;
+
 	// Copies left by runs that were cut off: keep one, move the rest to the trash.
 	let duplicatesRemoved = 0;
 	for (const copies of existing.values()) {
 		if (copies.length < 2) continue;
 		const keep = keeperOf(copies);
 		for (const copy of copies) {
-			if (copy === keep) continue;
+			if (copy === keep || budget === 0) continue;
+			budget--;
 			if (await ctx.content!.delete!(collection, copy.id)) duplicatesRemoved++;
 		}
 		copies.splice(0, copies.length, keep);
 	}
-
-	let budget = MAX_PER_RUN;
-	let published = 0;
 
 	// Saved earlier but never published.
 	for (const post of posts) {
@@ -179,7 +191,6 @@ async function sync(ctx: PluginContext): Promise<SyncResult> {
 		if (await publish(ctx, collection, item.id)) published++;
 	}
 
-	await ctx.kv.set("state:lastSync", new Date().toISOString());
 	return {
 		status: "ok",
 		created,
@@ -196,16 +207,8 @@ const plugin: SandboxedPlugin = {
 		cron: {
 			timeout: CRON_TIMEOUT_MS,
 			handler: async (event, ctx) => {
-				if (event.name !== CRON_TASK) return;
-				const result = await sync(ctx);
-				if (
-					result.status === "ok" &&
-					(result.created > 0 || result.published > 0 || result.duplicatesRemoved > 0)
-				) {
-					ctx.log.info(
-						`Bluesky Feed synced: ${result.created} saved, ${result.published} published, ${result.duplicatesRemoved} duplicates removed, ${result.remaining} waiting`,
-					);
-				}
+				// No log on success: a log line is a subrequest too.
+				if (event.name === CRON_TASK) await sync(ctx);
 			},
 		},
 	},

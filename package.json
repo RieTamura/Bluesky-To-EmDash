@@ -1,8 +1,14 @@
 {
 	"name": "bluesky-feed",
 	"version": "0.1.0",
+	"description": "Shows your own Bluesky posts on your EmDash site by syncing them into a collection.",
 	"private": true,
 	"type": "module",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/RieTamura/Bluesky-To-EmDash.git"
+	},
 	"packageManager": "npm@11.13.0",
 	"main": "dist/index.mjs",
 	"exports": {
@@ -19,6 +25,7 @@
 	"scripts": {
 		"validate": "emdash-plugin validate",
 		"build": "emdash-plugin build",
+		"prepare": "emdash-plugin build",
 		"dev": "emdash-plugin dev",
 		"typecheck": "tsc --noEmit",
 		"test": "emdash-plugin validate && vitest run",

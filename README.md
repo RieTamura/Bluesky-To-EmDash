@@ -2,9 +2,30 @@
 
 An EmDash plugin that copies your own Bluesky posts into a collection on your site, so your theme can show them next to your posts.
 
-Every five minutes it reads your public author feed from `public.api.bsky.app` (no login, no app password), skips replies and reposts, and saves each new post as an entry, then publishes it. Publishing purges the collection's cache tag, so cached pages pick the post up on the next request. It saves at most three new posts per run and picks up the rest on later runs.
+Every five minutes it reads your public author feed from `public.api.bsky.app` (no login, no app password), skips replies and reposts, and saves each new post as an entry, then publishes it. Publishing purges the collection's cache tag, so cached pages pick the post up on the next request. It saves one new post per run, so it stays within the sandbox's limit of 10 subrequests, and picks up the rest on later runs. A post you delete in the admin is not saved again.
 
 The plugin only stores the posts. How they look on the site is up to your theme: query the collection like any other.
+
+[日本語の説明はこちら](README_JA.md)
+
+## Install
+
+From the EmDash plugin registry, install **Bluesky Feed** in the admin. Registry plugins run in the plugin sandbox, which on Cloudflare needs the Workers Paid plan.
+
+Or install it from GitHub and run it in-process from `astro.config.mjs`, which needs no sandbox. npm builds it on install:
+
+```sh
+npm install github:RieTamura/Bluesky-To-EmDash
+```
+
+```js
+import blueskyFeed from "bluesky-feed";
+
+emdash({
+	// ...
+	plugins: [blueskyFeed],
+});
+```
 
 ## Setup
 
@@ -53,12 +74,23 @@ If the collection or a field is missing, the plugin logs a warning and writes no
 
 ## Routes
 
-- `POST /_emdash/api/plugins/bluesky-feed/sync` (admin only): run a sync now. Returns `{ status, created, remaining }`.
+- `POST /_emdash/api/plugins/bluesky-feed/sync` (admin only): run a sync now. Returns `{ status, created, published, duplicatesRemoved, remaining }`.
 
 ## Development
 
 ```sh
 npm install
-npm test        # validate the manifest, then run the tests in the sandbox
+npm test           # validate the manifest, then run the tests in the sandbox
+npm run typecheck
 npm run build
 ```
+
+Bump `version` in `package.json` when you ship a release. `emdash-plugin.jsonc` omits `version`; the build reads it from `package.json`.
+
+## Reporting a problem
+
+Open an issue at <https://github.com/RieTamura/Bluesky-To-EmDash/issues>. For a security problem, please say so in the title and leave out the details; I will reply with a private way to send them.
+
+## License
+
+MIT

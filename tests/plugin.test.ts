@@ -141,17 +141,24 @@ describe("sync", () => {
 		expect(await h.inspect.storage.get("posts", "aaa")).toMatchObject({ contentId: draft.id });
 	});
 
-	it("moves extra copies of a post to the trash, keeping one", async () => {
+	it("moves extra copies of a post to the trash one per run, keeping one", async () => {
 		const h = await setup();
 		const uri = `at://${DID}/app.bsky.feed.post/aaa`;
 		const first = await h.fixtures.content("bluesky", { slug: "a-1", data: { title: "a", post_uri: uri } });
 		await h.fixtures.content("bluesky", { slug: "a-2", data: { title: "a", post_uri: uri } });
 		await h.fixtures.content("bluesky", { slug: "a-3", data: { title: "a", post_uri: uri } });
-		await h.http.respond(FEED_URL, feedResponse([feedPost("aaa", "2026-10-27T10:00:00.000Z")]));
 
-		const result = await h.transport.invokeRoute("sync", {}, { method: "POST" });
+		const results = [];
+		for (let i = 0; i < 3; i++) {
+			await h.http.respond(FEED_URL, feedResponse([feedPost("aaa", "2026-10-27T10:00:00.000Z")]));
+			results.push(await h.transport.invokeRoute("sync", {}, { method: "POST" }));
+		}
 
-		expect(result).toMatchObject({ duplicatesRemoved: 2, published: 1, created: 0 });
+		expect(results).toMatchObject([
+			{ duplicatesRemoved: 1, published: 0, created: 0 },
+			{ duplicatesRemoved: 1, published: 0, created: 0 },
+			{ duplicatesRemoved: 0, published: 1, created: 0 },
+		]);
 		const items = await h.inspect.content.list("bluesky");
 		const live = items.filter((item) => item.status !== "trash" && !("deletedAt" in item && item.deletedAt));
 		expect(live.map((item) => item.id)).toContain(first.id);
@@ -181,6 +188,13 @@ describe("sync", () => {
 		const result = await h.transport.invokeRoute("sync", {}, { method: "POST" });
 		expect(result).toMatchObject({ status: "collection_invalid", collection: "bluesky" });
 		expect(h.http.requests()).toHaveLength(0);
+	});
+
+	it("checks the collection named in the settings", async () => {
+		const h = await setup();
+		await h.fixtures.plugin.setting("collection", " posts_from_bluesky ");
+		const result = await h.transport.invokeRoute("sync", {}, { method: "POST" });
+		expect(result).toMatchObject({ status: "collection_invalid", collection: "posts_from_bluesky" });
 	});
 
 	it("reports a failed Bluesky request", async () => {
