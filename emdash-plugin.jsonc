@@ -7,7 +7,10 @@
 	"license": "MIT",
 	"author": { "name": "Rie Tamura", "url": "https://bsky.app/profile/connectobasan.com" },
 	"security": { "url": "https://github.com/RieTamura/Bluesky-To-EmDash/issues" },
+	"name": "Bluesky To EmDash",
 	"description": "Shows your own Bluesky posts on your EmDash site by syncing them into a collection.",
+	"keywords": ["bluesky", "atproto", "social", "feed", "timeline"],
+	"repo": "https://github.com/RieTamura/Bluesky-To-EmDash",
 
 	// Trust contract — what runtime APIs the plugin asks for.
 	// Changing these between releases requires a version bump because
